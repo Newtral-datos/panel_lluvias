@@ -1,0 +1,15 @@
+
+__pycache__/
+*.pyc
+.venv/
+credenciales_google_sheet.json
+
+*.tif
+*.tiff
+*.zip
+*.tar
+*.tar.gz
+complementarios_mar/*.tif
+complementarios_mar/*.tiff
+.DS_Store
+__MACOSX/
