@@ -1,0 +1,67 @@
+name: Actualización del panel de lluvias
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      GOOGLE_CRED_PATH: ${{ github.workspace }}/credenciales_google_sheet.json
+      TZ: Europe/Madrid
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps (wheels)
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            numpy==1.26.4 \
+            pandas==2.2.2 \
+            requests==2.32.3 \
+            urllib3==2.2.2 \
+            babel==2.15.0 \
+            shapely==2.0.4 \
+            pyproj==3.6.1 \
+            fiona==1.9.6 \
+            rasterio==1.3.10 \
+            geopandas==0.14.4 \
+            google-auth==2.34.0 \
+            google-auth-httplib2==0.2.0 \
+            google-api-python-client==2.142.0 \
+            matplotlib==3.8.4 \
+            openpyxl==3.1.5
+
+      - name: Write Google credentials from secret
+        shell: bash
+        run: |
+          cat > "$GOOGLE_CRED_PATH" << 'JSON'
+          ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_JSON }}
+          JSON
+          test -s "$GOOGLE_CRED_PATH" && echo "Credenciales escritas."
+
+      - name: Create expected absolute path and symlink
+        run: |
+          sudo mkdir -p /Users/miguel.ros/Desktop
+          if [ -e /Users/miguel.ros/Desktop/PANEL_LLUVIAS ]; then
+            sudo rm -rf /Users/miguel.ros/Desktop/PANEL_LLUVIAS
+          fi
+          sudo ln -s "${GITHUB_WORKSPACE}" "/Users/miguel.ros/Desktop/PANEL_LLUVIAS"
+          ls -la /Users/miguel.ros/Desktop
+
+      - name: Run pipeline
+        run: |
+          python -V
+          python PANEL_LLUVIAS_PIPELINE.py
