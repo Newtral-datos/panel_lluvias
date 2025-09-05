@@ -52,16 +52,27 @@ jobs:
           JSON
           test -s "$GOOGLE_CRED_PATH" && echo "Credenciales escritas."
 
-      - name: Create expected absolute path and symlink
+      - name: Create expected absolute paths and symlinks
         run: |
           sudo mkdir -p /Users/miguel.ros/Desktop
+
           if [ -e /Users/miguel.ros/Desktop/PANEL_LLUVIAS ]; then
             sudo rm -rf /Users/miguel.ros/Desktop/PANEL_LLUVIAS
           fi
           sudo ln -s "${GITHUB_WORKSPACE}" "/Users/miguel.ros/Desktop/PANEL_LLUVIAS"
+
+          sudo mkdir -p /Users/miguel.ros/Desktop/GITHUB
+          if [ -e /Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias ]; then
+            sudo rm -rf /Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias
+          fi
+          sudo ln -s "${GITHUB_WORKSPACE}" "/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias"
+
+          echo "Symlinks creados:"
           ls -la /Users/miguel.ros/Desktop
+          ls -la /Users/miguel.ros/Desktop/GITHUB || true
 
       - name: Run pipeline
         run: |
           python -V
           python PANEL_LLUVIAS_PIPELINE.py
+
