@@ -24,6 +24,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Setup Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Setup Chromedriver
+        uses: browser-actions/setup-chromedriver@v1
+        with:
+          chrome-version: ${{ steps.chrome.outputs.chrome-version }}
+
       - name: Install Python deps (wheels)
         run: |
           python -m pip install --upgrade pip
@@ -42,7 +51,8 @@ jobs:
             google-auth-httplib2==0.2.0 \
             google-api-python-client==2.142.0 \
             matplotlib==3.8.4 \
-            openpyxl==3.1.5
+            openpyxl==3.1.5 \
+            selenium==4.24.0
 
       - name: Write Google credentials from secret
         shell: bash
@@ -67,7 +77,6 @@ jobs:
           fi
           sudo ln -s "${GITHUB_WORKSPACE}" "/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias"
 
-          echo "Symlinks creados:"
           ls -la /Users/miguel.ros/Desktop
           ls -la /Users/miguel.ros/Desktop/GITHUB || true
 
@@ -75,4 +84,3 @@ jobs:
         run: |
           python -V
           python PANEL_LLUVIAS_PIPELINE.py
-
