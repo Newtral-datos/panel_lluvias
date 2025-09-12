@@ -1,22 +1,34 @@
+# sst_actual_12utc.py
+# pip install requests rasterio numpy shapely geopandas pandas python-dateutil
+
 import requests, rasterio, numpy as np, geopandas as gpd, pandas as pd
 from shapely.geometry import Point
 from pathlib import Path
 from datetime import datetime
 
-# --- Parámetros.
+# ===========================
+# ⟵ PARÁMETROS AJUSTABLES
+# ===========================
+# BBox de partida (puedes poner el grande o uno ya centrado en España)
 START_LAT_MIN, START_LAT_MAX = 0.0, 60.0
 START_LON_MIN, START_LON_MAX = -40.0, 40.0
 
-# --- Cuánto quiero reducir el bbox.
+# Cuánto quiero reducir el bbox
 SHRINK = 0.2
+# ===========================
 
-# --- Configuración.
+# Configuración
 URL_WCS = "https://view.eumetsat.int/geoserver/ows"
 CAPA = "eps__osisaf_avhrr_l3_sst"
-DIR_SALIDA = Path("/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias/complementarios_mar/"); DIR_SALIDA.mkdir(parents=True, exist_ok=True)
+DIR_SALIDA = Path("/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_mar/"); DIR_SALIDA.mkdir(parents=True, exist_ok=True)
 PASO_CELDA = 2
 
 def shrink_bbox(lat_min, lat_max, lon_min, lon_max, shrink=0.2):
+    """
+    Reduce el bbox alrededor de su centro.
+    shrink=0.2 -> reduce un 20% total (10% por lado).
+    Devuelve (lat_min, lat_max, lon_min, lon_max).
+    """
     if not (0 <= shrink < 1):
         raise ValueError("SHRINK debe estar en [0, 1).")
     lat_c = (lat_min + lat_max) / 2.0
@@ -25,26 +37,31 @@ def shrink_bbox(lat_min, lat_max, lon_min, lon_max, shrink=0.2):
     lon_half = (lon_max - lon_min) * (1 - shrink) / 2.0
     lat_min2, lat_max2 = lat_c - lat_half, lat_c + lat_half
     lon_min2, lon_max2 = lon_c - lon_half, lon_c + lon_half
+    # Limitar a mundo válido
     lat_min2, lat_max2 = max(-90.0, lat_min2), min(90.0, lat_max2)
     lon_min2, lon_max2 = max(-180.0, lon_min2), min(180.0, lon_max2)
     return lat_min2, lat_max2, lon_min2, lon_max2
 
+# Aplica el shrink al bbox de partida
 LAT_MIN, LAT_MAX, LON_MIN, LON_MAX = shrink_bbox(
     START_LAT_MIN, START_LAT_MAX, START_LON_MIN, START_LON_MAX, shrink=SHRINK
 )
 print(f"BBox original:  lat=({START_LAT_MIN}, {START_LAT_MAX}), lon=({START_LON_MIN}, {START_LON_MAX})")
 print(f"BBox reducido:  lat=({LAT_MIN:.3f}, {LAT_MAX:.3f}), lon=({LON_MIN:.3f}, {LON_MAX:.3f})")
 
-hoy_utc = pd.Timestamp(datetime.utcnow().date())   ## Fecha de hoy (UTC) sin hora.
-ayer_utc = hoy_utc - pd.Timedelta(days=1)          ## Día anterior.
-fecha = ayer_utc + pd.Timedelta(hours=12)          ## 12:00Z del día anterior.
+# === Ayer a las 12:00 UTC ===
+hoy_utc = pd.Timestamp(datetime.utcnow().date())   # fecha de hoy (UTC) sin hora
+ayer_utc = hoy_utc - pd.Timedelta(days=1)          # día anterior
+fecha = ayer_utc + pd.Timedelta(hours=12)          # 12:00Z del día anterior
 fecha_iso = fecha.strftime("%Y-%m-%dT%H:%M:%SZ")
 print("Descargando datos para:", fecha_iso)
 
+# Salidas con fecha para no sobrescribir (opcional)
 stamp = fecha.strftime("%Y%m%d_12utc")
 TIF_SALIDA = DIR_SALIDA / f"temperatura_mar_{stamp}.tif"
 GEOJSON_SALIDA = DIR_SALIDA / f"temperatura_mar_{stamp}.geojson"
 
+# Descargar raster (WCS)
 params = {
     "service": "WCS","version": "2.0.1","request": "GetCoverage","coverageId": CAPA,
     "format": "image/tiff",
@@ -58,12 +75,14 @@ resp.raise_for_status()
 with open(TIF_SALIDA, "wb") as f:
     f.write(resp.content)
 
+# Procesar raster en puntos
 with rasterio.open(TIF_SALIDA) as ds:
     arr = ds.read(1).astype("float64")
     nodata, tags, transform = ds.nodata, ds.tags(1), ds.transform
 if nodata is not None:
     arr[arr == nodata] = np.nan
 arr = arr * float(tags.get("scale_factor", 1.0)) + float(tags.get("add_offset", 0.0))
+# Convertir a °C si está en Kelvin
 if np.nanmin(arr) > 150:
     arr = arr - 273.15
 
@@ -81,15 +100,13 @@ for r in range(0, filas, PASO_CELDA):
 
 gdf = gpd.GeoDataFrame({"sst_c": vals, "lon": lons, "lat": lats}, geometry=geoms, crs="EPSG:4326")
 
-bins = list(range(5, 45, 5))
+# Categorizar SST
+bins = list(range(5, 45, 5))  # 5–40
 etiquetas = [f"{bins[i]}–{bins[i+1]}" for i in range(len(bins)-1)]
 gdf["categoria"] = pd.cut(gdf["sst_c"], bins=bins, labels=etiquetas, include_lowest=True)
 gdf["sst_txt"] = gdf["sst_c"].apply(lambda x: f"{x:.1f}".replace(".", ","))
 
-for col in gdf.columns:
-    if pd.api.types.is_categorical_dtype(gdf[col]):
-        gdf[col] = gdf[col].astype(str)
-
+# Guardar GeoJSON
 gdf.to_file(GEOJSON_SALIDA, driver="GeoJSON")
 print("GeoJSON guardado en:", GEOJSON_SALIDA)
 print("Total de puntos:", len(gdf))

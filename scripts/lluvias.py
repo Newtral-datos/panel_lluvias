@@ -1,3 +1,4 @@
+# aemet_pipeline.py
 from __future__ import annotations
 
 import json
@@ -17,6 +18,7 @@ import matplotlib.pyplot as plt
 
 from api_keys import api_keys
 
+# --- Google Sheets ---
 import math, re
 from datetime import datetime as _dt
 from pandas.api.types import is_datetime64_any_dtype, is_datetime64tz_dtype
@@ -30,14 +32,16 @@ try:
 except Exception:
     _GSHEETS_DISPONIBLE = False
 
-# --- Configuración.
+# =========================
+# Configuración
+# =========================
 BASE = "https://opendata.aemet.es/opendata/api"
 _TZ_LOCAL = ZoneInfo("Europe/Madrid")
 
-RUTA_INDICATIVOS       = "/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias/complementarios_lluvias/ids_estaciones.xlsx"
-RUTA_MAESTRO           = "/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias/complementarios_lluvias/datos_mapa.xlsx"
-RUTA_BASE              = "/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias/"
-RUTA_COMPLEMENTARIOS   = "/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias/complementarios_lluvias/"
+RUTA_INDICATIVOS       = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/ids_estaciones.xlsx"
+RUTA_MAESTRO           = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/datos_mapa.xlsx"
+RUTA_BASE              = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/"
+RUTA_COMPLEMENTARIOS   = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/"
 
 SUBIR_A_SHEETS   = True
 ID_HOJA_CALCULO  = "1o0DICxbYpq_OqgwTqU9-8GaQzjYj14cdureHGN-uLQA"
@@ -46,7 +50,9 @@ INICIO_A1        = f"{NOMBRE_PESTANA}!A1"
 RUTA_CREDENCIALES = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/credenciales_google_sheet.json"
 ALCANCES_SHEETS  = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# --- Descarga.
+# =========================
+# Descarga y helpers
+# =========================
 def sesion_reintentos() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "aemet-downloader/1.1", "Connection": "close", "Accept": "application/json"})
@@ -153,6 +159,7 @@ def _quizas_esperar_por_429(err: Exception) -> bool:
         return True
     return False
 
+# ===== Sonda rápida + selección del último día con datos =====
 def _probe_aemet_rapido(indicativo: str, fecha: datetime.date, api_key: str) -> bool:
     fechaini = f"{fecha:%Y-%m-%d}T00:00:00UTC"
     fechafin = f"{fecha:%Y-%m-%d}T23:59:00UTC"
@@ -192,7 +199,9 @@ def _fecha_aemet_mas_reciente(indicativo: str, max_retraso: int = 5, deadline_se
     candidato = hoy_local - timedelta(days=max_retraso)
     return (f"{candidato:%Y-%m-%d}T00:00:00UTC", f"{candidato:%Y-%m-%d}T23:59:00UTC")
 
-# --- Descarga de datos de estaciones.
+# =========================
+# Descarga por indicativos
+# =========================
 def descargar_por_indicativos_xlsx(
     ruta_indicativos: str | Path,
     hoja: int | str = 0,
@@ -207,7 +216,7 @@ def descargar_por_indicativos_xlsx(
         .replace("", pd.NA).dropna().unique().tolist()
     )
 
-    ## Detectar el día más reciente con datos.
+    # Detectar el día más reciente con datos (sonda rápida, 1-3 indicativos)
     print("Determinando día más reciente con datos (sonda rápida)…")
     fechaini = fechafin = None
     for probe in indicativos[:3]:
@@ -274,7 +283,9 @@ def combinar_con_maestro(
     combinado = maestro.merge(base[[clave] + cols_aemet], on=clave, how="left")
     return combinado
 
-# --- Limpieza.
+# =========================
+# Limpieza / adaptación
+# =========================
 def invertir_coma(texto: str):
     if not isinstance(texto, str) or "," not in texto:
         return texto
@@ -366,7 +377,9 @@ def categorizar_y_plot(maestro: pd.DataFrame) -> pd.DataFrame:
     return maestro
 
 
-# --- Subir a Google Sheets.
+# =========================
+# Google Sheets
+# =========================
 def hora() -> str:
     return _dt.now().strftime("[%Y-%m-%d %H:%M:%S] ")
 
@@ -456,7 +469,9 @@ def subir_df_a_sheet(
         )
         print(f"{hora()}  · Bloque {i+1}/{bloques} ({i1 - i0} filas) OK")
 
-# --- Ejecutar la función.
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
     print("Descargando por indicativos del Excel…")
     df_todas = descargar_por_indicativos_xlsx(RUTA_INDICATIVOS)
@@ -464,6 +479,7 @@ if __name__ == "__main__":
     print("Combinando con maestro…")
     df_maestro = combinar_con_maestro(df_todas, RUTA_MAESTRO)
 
+    # Guardar df_maestro.xlsx dentro de Complementarios
     ruta_complementarios = Path(RUTA_COMPLEMENTARIOS)
     ruta_complementarios.mkdir(parents=True, exist_ok=True)
     ruta_df_maestro = ruta_complementarios / "df_maestro.xlsx"
@@ -474,14 +490,17 @@ if __name__ == "__main__":
     maestro = transformar_maestro(df_maestro)
     maestro = categorizar_y_plot(maestro)
 
+    # Categorías: poner celdas vacías en lugar de NaN antes de exportar
     if "categoria" in maestro.columns:
         maestro["categoria"] = maestro["categoria"].astype(object).where(maestro["categoria"].notna(), "")
 
+    # Export final
     ruta_final = Path(RUTA_BASE) / "MAPA_LLUVIAS.xlsx"
     with pd.ExcelWriter(ruta_final, engine="openpyxl") as writer:
         maestro.to_excel(writer, index=False)
     print("Exportado:", ruta_final)
 
+    # Subida a Google Sheets
     if SUBIR_A_SHEETS:
         if not _GSHEETS_DISPONIBLE:
             print("AVISO: faltan dependencias de Google Sheets (pip install google-api-python-client google-auth-httplib2 google-auth httplib2)")

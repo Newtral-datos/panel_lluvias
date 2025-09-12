@@ -5,7 +5,7 @@ from datetime import datetime as _dt
 from pandas.api.types import is_datetime64_any_dtype, is_datetime64tz_dtype
 from pathlib import Path
 
-directorio = "/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias/"
+directorio = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/"
 
 # --- Estadísticas de las lluvias.
 ruta_historico_lluvias = f"{directorio}complementarios_lluvias/"

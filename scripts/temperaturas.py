@@ -1,3 +1,4 @@
+# aemet_temperaturas_pipeline.py
 from __future__ import annotations
 
 import json
@@ -29,19 +30,25 @@ try:
 except Exception:
     _GSHEETS_DISPONIBLE = False
 
-# --- Configuración.
+# =========================
+# Configuración
+# =========================
 BASE = "https://opendata.aemet.es/opendata/api"
 _TZ_LOCAL = ZoneInfo("Europe/Madrid")
 
+# Rutas para el proyecto de TEMPERATURAS
 RUTA_BASE            = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/"
 RUTA_INDICATIVOS     = f"{RUTA_BASE}complementarios_temperaturas/ids_estaciones_reducido.xlsx"
 RUTA_MAESTRO         = f"{RUTA_BASE}complementarios_temperaturas/datos_mapa.xlsx"
 RUTA_SALIDAS         = Path(RUTA_BASE)
 
+# Salidas locales
 NOMBRE_XLSX_INTERMEDIO = "df_maestro.xlsx"
 NOMBRE_XLSX_FINAL      = "MAPA_TEMPERATURAS.xlsx"
 
-# --- Subir a Google Sheets.
+# =========================
+# Subida a Google Sheets (opcional)
+# =========================
 SUBIR_A_SHEETS    = True
 ID_HOJA_CALCULO   = "1o0DICxbYpq_OqgwTqU9-8GaQzjYj14cdureHGN-uLQA"
 NOMBRE_PESTANA    = "temperaturas"
@@ -158,6 +165,7 @@ def _quizas_esperar_por_429(err: Exception) -> bool:
         return True
     return False
 
+# ===== Sonda rápida + selección del último día con datos =====
 def _probe_aemet_rapido(indicativo: str, fecha: datetime.date, api_key: str) -> bool:
     fechaini = f"{fecha:%Y-%m-%d}T00:00:00UTC"
     fechafin = f"{fecha:%Y-%m-%d}T23:59:00UTC"
@@ -279,7 +287,9 @@ def combinar_con_maestro(
     combinado = maestro.merge(base[[clave] + cols_aemet], on=clave, how="left")
     return combinado
 
-# --- Limpieza.
+# =========================
+# Limpieza / adaptación (temperaturas)
+# =========================
 def invertir_coma(texto: str):
     if not isinstance(texto, str) or "," not in texto:
         return texto
@@ -319,6 +329,7 @@ def transformar_maestro_temperaturas(maestro: pd.DataFrame) -> pd.DataFrame:
         maestro["tmax_txt"] = maestro["tmax"].apply(num_a_texto)
         maestro["media_maxima_historica_txt"] = maestro["media_maxima_historica"].apply(num_a_texto)
 
+        # diferencia con signo
         maestro["diferencia_txt"] = maestro["diferencia"].apply(
             lambda x: f"+{num_a_texto(x)}" if x > 0 
                     else f"-{num_a_texto(abs(x))}" if x < 0 
@@ -332,6 +343,7 @@ def transformar_maestro_temperaturas(maestro: pd.DataFrame) -> pd.DataFrame:
         cat_dtype = pd.api.types.CategoricalDtype(categories=labels, ordered=True)
         maestro["categoria"] = maestro["categoria"].astype(cat_dtype)
 
+        # Determinar qué categorías no aparecen
         presentes = set(maestro["categoria"].dropna().astype(str).unique())
         faltantes = [lab for lab in labels if lab not in presentes]
 
@@ -346,7 +358,7 @@ def transformar_maestro_temperaturas(maestro: pd.DataFrame) -> pd.DataFrame:
             filas = []
             for lab in faltantes:
                 fila = base.copy()
-                fila["categoria"] = lab
+                fila["categoria"] = lab  # valor de la categoría
                 filas.append(fila)
 
             if filas:
@@ -365,7 +377,9 @@ def transformar_maestro_temperaturas(maestro: pd.DataFrame) -> pd.DataFrame:
     return maestro
 
 
-# --- Subir a Google Sheets.
+# =========================
+# Google Sheets
+# =========================
 def hora() -> str:
     return _dt.now().strftime("[%Y-%m-%d %H:%M:%S] ")
 
@@ -456,7 +470,9 @@ def subir_df_a_sheet(
         )
         print(f"{hora()}  · Bloque {i+1}/{bloques} ({i1 - i0} filas) OK")
 
-# --- Ejecutar la función.
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
     RUTA_SALIDAS.mkdir(parents=True, exist_ok=True)
 

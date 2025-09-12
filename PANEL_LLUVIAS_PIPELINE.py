@@ -12,7 +12,8 @@ PIPELINE = [
     (SCRIPTS / "temperaturas.py", [], None),
     (SCRIPTS / "mar_temperatura_actual.py", [], None),
     (SCRIPTS / "mar_comparacion.py", [], None),
-    (SCRIPTS / "estadisticas.py", [], None)
+    (SCRIPTS / "estadisticas.py", [], None),
+    (SCRIPTS / "avisos_aemet.py", [], None)
 ]
 
 def run_step(script: Path, args: list[str], timeout: int | None):

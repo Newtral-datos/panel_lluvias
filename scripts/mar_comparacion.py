@@ -1,12 +1,18 @@
+# -*- coding: utf-8 -*-
+
 import geopandas as gpd
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
 
-# --- Configuración.
-DIR = Path("/Users/miguel.ros/Desktop/GITHUB/repositorio_panel_lluvias/complementarios_mar/")
+# =========================
+# Configuración de paths
+# =========================
+DIR = Path("/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_mar/")
 
-# --- Subida a Google Sheets.
+# =========================
+# Opciones de subida a Google Sheets
+# =========================
 SUBIR_A_SHEETS    = True
 ID_HOJA_CALCULO   = "1o0DICxbYpq_OqgwTqU9-8GaQzjYj14cdureHGN-uLQA"
 NOMBRE_PESTANA    = "temperatura_mar"
@@ -14,6 +20,9 @@ INICIO_A1         = f"{NOMBRE_PESTANA}!A1"
 RUTA_CREDENCIALES = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/credenciales_google_sheet.json"
 ALCANCES_SHEETS   = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# =========================
+# Dependencias y helpers Google Sheets
+# =========================
 import re, time, math
 from datetime import datetime as _dt
 from pandas.api.types import is_datetime64_any_dtype, is_datetime64tz_dtype
@@ -72,10 +81,12 @@ def subir_df_a_sheet(
 
     df = df.copy()
 
+    # Asegurar que lat/lon como texto si existiesen con estos nombres habituales
     for c in ["LATITUD", "LONGITUD", "LATITUDE", "LONGITUDE", "latitud", "longitud"]:
         if c in df.columns:
             df[c] = df[c].astype(str)
 
+    # Formatear columnas de fecha/hora
     for col in df.columns:
         if is_datetime64_any_dtype(df[col]) or is_datetime64tz_dtype(df[col]):
             df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -133,57 +144,73 @@ def subir_df_a_sheet(
         )
         print(f"{hora()}  · Bloque {i+1}/{bloques} ({i1 - i0} filas) OK")
 
-# --- Carácter invisible para Flourish.
-INVISIBLE_PREFIX = "\u200B"
+# =========================
+# Lógica original
+# =========================
 
-hoy_utc = pd.Timestamp(datetime.utcnow().date())   ## Fecha de hoy (UTC) sin hora.
-ayer_utc = hoy_utc - pd.Timedelta(days=1)          ## Día anterior.
-fecha = ayer_utc + pd.Timedelta(hours=12)          ## 12:00Z del día anterior.
+# Carácter invisible para forzar tipo texto en parsers (Flourish, etc.)
+INVISIBLE_PREFIX = "\u200B"  # zero-width space
+
+hoy_utc = pd.Timestamp(datetime.utcnow().date())   # fecha de hoy (UTC) sin hora
+ayer_utc = hoy_utc - pd.Timedelta(days=1)          # día anterior
+fecha = ayer_utc + pd.Timedelta(hours=12)          # 12:00Z del día anterior
 stamp = fecha.strftime("%Y%m%d_12utc")
 
+# Leer datos
 gdf_actual = gpd.read_file(DIR / f"temperatura_mar_{stamp}.geojson")[["lon", "lat", "sst_c"]]
 gdf_actual = gdf_actual.rename(columns={"sst_c": "sst_actual"})
 
 gdf_hist = gpd.read_file(DIR / "ssc_septiembre_historico.geojson")[["lon", "lat", "sst_media_sep_c"]]
 
+# Asegurar que lon y lat son numéricas float
 for col in ["lon", "lat"]:
     gdf_actual[col] = pd.to_numeric(gdf_actual[col], errors="coerce").astype(float)
     gdf_hist[col] = pd.to_numeric(gdf_hist[col], errors="coerce").astype(float)
 
+# Usar valor histórico tal cual (sin calcular medias)
 df_hist_media = gdf_hist.rename(columns={"sst_media_sep_c": "sst_hist_media"})
 
+# Unir y calcular diferencia
 df_comp = gdf_actual.merge(df_hist_media, on=["lon", "lat"], how="inner")
 df_comp["diferencia"] = df_comp["sst_actual"] - df_comp["sst_hist_media"]
 
+# Redondear temperaturas a 1 decimal
 temp_cols = ["sst_actual", "sst_hist_media", "diferencia"]
 df_comp[temp_cols] = df_comp[temp_cols].astype(float).round(1)
 
+# Categorización de sst_actual
 bins = list(range(5, 45, 5))
 labels = [f"{bins[i]}–{bins[i+1]}" for i in range(len(bins)-1)]
 df_comp["sst_actual_cat"] = pd.cut(df_comp["sst_actual"], bins=bins, labels=labels, include_lowest=True)
 
+# Formateadores (coma decimal)
 def fmt_es(x):
     if pd.isna(x):
         return ""
     s = f"{x:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return INVISIBLE_PREFIX + s
+    return INVISIBLE_PREFIX + s  # fuerza texto
 
 def fmt_es_signed(x):
     if pd.isna(x):
         return ""
     s = f"{x:+,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return INVISIBLE_PREFIX + s
+    return INVISIBLE_PREFIX + s  # fuerza texto y mantiene el +
 
+# Crear columnas de texto
 for c in temp_cols:
     df_comp[c + "_txt"] = df_comp[c].apply(fmt_es)
+# Sobrescribir diferencia_txt con formato con signo (+ también en 0)
 df_comp["diferencia_txt"] = df_comp["diferencia"].apply(fmt_es_signed)
 
+# Asegurar tipos: numéricos en lon/lat y temp_cols
 for c in ["lon", "lat"] + temp_cols:
     df_comp[c] = df_comp[c].astype(float)
 
+# Asegurar que *_txt son texto
 for c in [col + "_txt" for col in temp_cols]:
     df_comp[c] = df_comp[c].astype(str)
 
+# Orden columnas
 cols = ["lon", "lat", "sst_actual", "sst_actual_cat", "sst_hist_media", "diferencia"] \
        + [c + "_txt" for c in temp_cols]
 df_comp = df_comp[cols]
@@ -191,13 +218,16 @@ ayer_str = ayer_utc.strftime("%d/%m/%Y")
 FECHA_ACTUALIZADO = ayer_str
 df_comp["fecha_actualizado"] = FECHA_ACTUALIZADO
 
+# Exportar a XLSX
 out_xlsx = DIR / "comparacion_actual_vs_hist.xlsx"
 df_comp.to_excel(out_xlsx, index=False, sheet_name="comparacion")
 
 print("Guardado:", out_xlsx)
 print(df_comp.dtypes)
 
-# --- Subir a Google Sheets.
+# =========================
+# Subida a Google Sheets (opcional)
+# =========================
 if SUBIR_A_SHEETS:
     print(f"{hora()}Subiendo DataFrame a Google Sheets…")
     try:
