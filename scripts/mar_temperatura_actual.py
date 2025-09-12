@@ -1,5 +1,5 @@
 # sst_actual_12utc.py
-# pip install requests rasterio numpy shapely geopandas pandas python-dateutil
+# Requisitos: pip install requests rasterio numpy shapely geopandas pandas python-dateutil
 
 import requests, rasterio, numpy as np, geopandas as gpd, pandas as pd
 from shapely.geometry import Point
@@ -18,7 +18,7 @@ URL_WCS = "https://view.eumetsat.int/geoserver/ows"
 CAPA = "eps__osisaf_avhrr_l3_sst"
 DIR_SALIDA = Path("/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_mar/")
 DIR_SALIDA.mkdir(parents=True, exist_ok=True)
-PASO_CELDA = 2
+PASO_CELDA = 2  # muestreo del ráster al exportar puntos
 
 def shrink_bbox(lat_min, lat_max, lon_min, lon_max, shrink=0.2):
     if not (0 <= shrink < 1):
@@ -39,6 +39,7 @@ LAT_MIN, LAT_MAX, LON_MIN, LON_MAX = shrink_bbox(
 print(f"BBox original:  lat=({START_LAT_MIN}, {START_LAT_MAX}), lon=({START_LON_MIN}, {START_LON_MAX})")
 print(f"BBox reducido:  lat=({LAT_MIN:.3f}, {LAT_MAX:.3f}), lon=({LON_MIN:.3f}, {LON_MAX:.3f})")
 
+# Ayer a las 12:00 UTC
 hoy_utc = pd.Timestamp(datetime.utcnow().date())
 ayer_utc = hoy_utc - pd.Timedelta(days=1)
 fecha = ayer_utc + pd.Timedelta(hours=12)
@@ -49,10 +50,18 @@ stamp = fecha.strftime("%Y%m%d_12utc")
 TIF_SALIDA = DIR_SALIDA / f"temperatura_mar_{stamp}.tif"
 GEOJSON_SALIDA = DIR_SALIDA / f"temperatura_mar_{stamp}.geojson"
 
+# Descargar ráster vía WCS
 params = {
-    "service": "WCS","version": "2.0.1","request": "GetCoverage","coverageId": CAPA,
+    "service": "WCS",
+    "version": "2.0.1",
+    "request": "GetCoverage",
+    "coverageId": CAPA,
     "format": "image/tiff",
-    "subset": [f'time("{fecha_iso}")', f"Lat({LAT_MIN},{LAT_MAX})", f"Long({LON_MIN},{LON_MAX})"]
+    "subset": [
+        f'time("{fecha_iso}")',
+        f"Lat({LAT_MIN},{LAT_MAX})",
+        f"Long({LON_MIN},{LON_MAX})",
+    ],
 }
 query = [(k, v) for k, v in params.items() if k != "subset"]
 for s in params["subset"]:
@@ -62,15 +71,25 @@ resp.raise_for_status()
 with open(TIF_SALIDA, "wb") as f:
     f.write(resp.content)
 
+# Leer y procesar ráster
 with rasterio.open(TIF_SALIDA) as ds:
     arr = ds.read(1).astype("float64")
-    nodata, tags, transform = ds.nodata, ds.tags(1), ds.transform
+    nodata = ds.nodata
+    tags = ds.tags(1) if ds.count >= 1 else {}
+    transform = ds.transform
+
 if nodata is not None:
     arr[arr == nodata] = np.nan
-arr = arr * float(tags.get("scale_factor", 1.0)) + float(tags.get("add_offset", 0.0))
+
+scale = float(tags.get("scale_factor", 1.0))
+offset = float(tags.get("add_offset", 0.0))
+arr = arr * scale + offset
+
+# Si parece Kelvin, convertir a °C
 if np.nanmin(arr) > 150:
     arr = arr - 273.15
 
+# Muestrear a puntos
 filas, cols = arr.shape
 geoms, vals, lons, lats = [], [], [], []
 for r in range(0, filas, PASO_CELDA):
@@ -80,16 +99,27 @@ for r in range(0, filas, PASO_CELDA):
             x, y = rasterio.transform.xy(transform, r, c)
             geoms.append(Point(x, y))
             vals.append(float(v))
-            lons.append(x)
-            lats.append(y)
+            lons.append(float(x))
+            lats.append(float(y))
 
 gdf = gpd.GeoDataFrame({"sst_c": vals, "lon": lons, "lat": lats}, geometry=geoms, crs="EPSG:4326")
 
-bins = list(range(5, 45, 5))
-etiquetas = [f"{bins[i]}–{bins[i+1]}" for i in range(len(bins)-1)]
+# Categorización y texto
+bins = list(range(5, 45, 5))  # 5–40
+etiquetas = [f"{bins[i]}–{bins[i+1]}" for i in range(len(bins) - 1)]
 gdf["categoria"] = pd.cut(gdf["sst_c"], bins=bins, labels=etiquetas, include_lowest=True)
 gdf["sst_txt"] = gdf["sst_c"].apply(lambda x: f"{x:.1f}".replace(".", ","))
 
-gdf.to_file(GEOJSON_SALIDA, driver="GeoJSON")
+# Convertir categorías a string para GeoJSON (Fiona no admite dtype 'category')
+for col in gdf.select_dtypes(include="category").columns:
+    gdf[col] = gdf[col].astype(str).fillna("")
+gdf["sst_txt"] = gdf["sst_txt"].astype(str)
+
+# Guardar GeoJSON (primero pyogrio si está, si no Fiona)
+try:
+    gdf.to_file(GEOJSON_SALIDA, driver="GeoJSON", engine="pyogrio", write_options={"RFC7946": "YES"})
+except Exception:
+    gdf.to_file(GEOJSON_SALIDA, driver="GeoJSON")
+
 print("GeoJSON guardado en:", GEOJSON_SALIDA)
 print("Total de puntos:", len(gdf))
