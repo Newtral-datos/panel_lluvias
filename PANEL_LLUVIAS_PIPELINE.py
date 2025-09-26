@@ -10,8 +10,8 @@ PY = sys.executable
 PIPELINE = [
     (SCRIPTS / "lluvias.py", [], None),
     (SCRIPTS / "temperaturas.py", [], None),
-    (SCRIPTS / "avisos_aemet.py", [], None),
     (SCRIPTS / "estadisticas.py", [], None),
+    (SCRIPTS / "avisos_aemet.py", [], None),
     (SCRIPTS / "mar_temperatura_actual.py", [], None),
     (SCRIPTS / "mar_comparacion.py", [], None)
 ]
