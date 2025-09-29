@@ -96,7 +96,7 @@ df_geo["geometry"] = df_geo["geometry"].apply(a_2d)
 df_geo = df_geo.to_crs(4326)
 
 # --- Mantener solo una fila por zona priorizando el mayor nivel de riesgo.
-prioridad_nivel = {"Riesgo importante": 2, "Riesgo": 1}
+prioridad_nivel = {"Riesgo extremo": 3, "Riesgo importante": 2, "Riesgo": 1}
 df_geo["_prioridad"] = df_geo["Nivel de riesgo"].map(prioridad_nivel).fillna(0)
 df_geo = (
     df_geo.sort_values("_prioridad", ascending=False)
@@ -133,13 +133,13 @@ if col_fenomeno is None or col_ccaa is None or col_nivel is None:
 datos[col_fenomeno] = datos[col_fenomeno].astype(str).str.lower()
 
 numeros_letras = {0:"cero",1:"uno",2:"dos",3:"tres",4:"cuatro",5:"cinco",6:"seis",7:"siete",8:"ocho",9:"nueve"}
-tipos_alertas  = {"Riesgo": "amarilla", "Riesgo importante": "naranja"}
+tipos_alertas  = {"Riesgo": "amarilla", "Riesgo importante": "naranja", "Riesgo extremo": "roja"}
 
 provincias_aviso = sorted(pd.Series(datos[col_ccaa]).astype(str).unique().tolist())
 n = len(provincias_aviso)
 n_letras = numeros_letras.get(n, str(n))
 
-prioridad = {"Riesgo": 1, "Riesgo importante": 2}
+prioridad = {"Riesgo": 1, "Riesgo importante": 2, "Riesgo extremo": 3}
 
 resumen = (
     datos.assign(Prioridad=datos[col_nivel].map(prioridad))
