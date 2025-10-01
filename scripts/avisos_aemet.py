@@ -20,28 +20,34 @@ driver = webdriver.Chrome(options=opts)
 # --- Descarga y parseo de la tabla HTML.
 data = []
 headers = []
+tabla_existe = True
 try:
     driver.get(URL)
-    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".table")))
+    # Espera corta y controlada: si no aparece la tabla, consideramos que no hay avisos.
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".table")))
     table = driver.find_element(By.CSS_SELECTOR, ".table")
     ths = table.find_elements(By.CSS_SELECTOR, "thead tr th")
     headers = [th.text.strip() for th in ths] if ths else []
     for tr in table.find_elements(By.CSS_SELECTOR, "tbody tr"):
         tds = tr.find_elements(By.CSS_SELECTOR, "td")
         data.append([td.text.strip() for td in tds])
+except Exception:
+    # No hay tabla o no cargó correctamente.
+    tabla_existe = False
 finally:
     driver.quit()
 
-# --- Construcción del DataFrame con cabeceras seguras.
-ncols = max((len(r) for r in data), default=0)
-if not headers or len(headers) != ncols:
-    headers = [f"col_{i+1}" for i in range(ncols)]
-data = [r + [""] * (ncols - len(r)) for r in data]
-df = pd.DataFrame(data, columns=headers)
-
-# --- Eliminación de columnas no necesarias.
-drop_cols = [c for c in df.columns if c.strip().lower() in ("probabilidad", "comentario")]
-df = df.drop(columns=drop_cols, errors="ignore")
+# --- Construcción del DataFrame con cabeceras seguras (cuando hay tabla).
+if tabla_existe and data:
+    ncols = max((len(r) for r in data), default=0)
+    if not headers or len(headers) != ncols:
+        headers = [f"col_{i+1}" for i in range(ncols)]
+    data = [r + [""] * (ncols - len(r)) for r in data]
+    df = pd.DataFrame(data, columns=headers)
+else:
+    # No hay tabla: df "ficticio" vacío para poder pasar por el pipeline si hiciera falta,
+    # pero lo importante es que en la subida usaremos el formato especial solicitado.
+    df = pd.DataFrame()
 
 def _norm(x: str) -> str:
     x = x.lower()
@@ -56,107 +62,124 @@ def only_time_series(s: pd.Series) -> pd.Series:
         out.loc[mask] = s.loc[mask].str.extract(r"(\d{1,2}:\d{2})", expand=False)
     return out.fillna("").str.strip()
 
-src = next((c for c in df.columns if _norm(c) in ("zona de avisos", "zona de aviso", "zona avisos", "zona")), None)
-if src is not None:
-    s = df[src].astype(str).str.replace("–", "-", regex=False)
-    parts = s.str.extract(r"^(?P<zona>.+?)\s*-\s*(?P<provincia>.+)$")
-    df["zona"] = parts["zona"].fillna(s).str.strip()
-    df["provincia"] = parts["provincia"].fillna("").str.strip()
-    df = df.drop(columns=[src])
-    df = df[["zona", "provincia"] + [c for c in df.columns if c not in ("zona", "provincia")]]
+# --- Si hay tabla, seguimos con el procesamiento normal. Si no, saltamos a la subida.
+if tabla_existe and not df.empty:
+    src = next((c for c in df.columns if _norm(c) in ("zona de avisos", "zona de aviso", "zona avisos", "zona")), None)
+    if src is not None:
+        s = df[src].astype(str).str.replace("–", "-", regex=False)
+        parts = s.str.extract(r"^(?P<zona>.+?)\s*-\s*(?P<provincia>.+)$")
+        df["zona"] = parts["zona"].fillna(s).str.strip()
+        df["provincia"] = parts["provincia"].fillna("").str.strip()
+        df = df.drop(columns=[src])
+        df = df[["zona", "provincia"] + [c for c in df.columns if c not in ("zona", "provincia")]]
 
-# --- Detección/normalización de columnas de inicio y fin.
-norm_cols = {c: _norm(c) for c in df.columns}
-col_inicio = next((c for c,nc in norm_cols.items() if nc in ("hora de comienzo","hora comienzo","inicio")), None)
-col_fin    = next((c for c,nc in norm_cols.items() if nc in ("hora de finalizacion","hora finalizacion","fin","hora de finalización")), None)
+    # --- Detección/normalización de columnas de inicio y fin.
+    norm_cols = {c: _norm(c) for c in df.columns}
+    col_inicio = next((c for c,nc in norm_cols.items() if nc in ("hora de comienzo","hora comienzo","inicio")), None)
+    col_fin    = next((c for c,nc in norm_cols.items() if nc in ("hora de finalizacion","hora finalizacion","fin","hora de finalización")), None)
 
-if col_inicio:
-    df[col_inicio] = only_time_series(df[col_inicio].astype(str))
-if col_fin:
-    df[col_fin] = only_time_series(df[col_fin].astype(str))
+    if col_inicio:
+        df[col_inicio] = only_time_series(df[col_inicio].astype(str))
+    if col_fin:
+        df[col_fin] = only_time_series(df[col_fin].astype(str))
 
-# --- Carga de delimitaciones AEMET y cruce por 'zona'.
-zonas_aemet = gpd.read_file("/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_avisos/delimitaciones_aemet.geojson")
-df_geo = df.merge(zonas_aemet, left_on="zona", right_on="zona", how="left")
-df_geo = gpd.GeoDataFrame(df_geo, geometry="geometry", crs=zonas_aemet.crs)
+    # --- Carga de delimitaciones AEMET y cruce por 'zona'.
+    zonas_aemet = gpd.read_file("/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_avisos/delimitaciones_aemet.geojson")
+    df_geo = df.merge(zonas_aemet, left_on="zona", right_on="zona", how="left")
+    df_geo = gpd.GeoDataFrame(df_geo, geometry="geometry", crs=zonas_aemet.crs)
 
-# --- Filtrado y reparación de geometrías inválidas.
-df_geo = df_geo[~df_geo.geometry.isna()].copy()
-invalidas = ~df_geo.geometry.is_valid
-if invalidas.any():
-    df_geo.loc[invalidas, "geometry"] = df_geo.loc[invalidas, "geometry"].buffer(0)
+    # --- Filtrado y reparación de geometrías inválidas.
+    df_geo = df_geo[~df_geo.geometry.isna()].copy()
+    invalidas = ~df_geo.geometry.is_valid
+    if invalidas.any():
+        df_geo.loc[invalidas, "geometry"] = df_geo.loc[invalidas, "geometry"].buffer(0)
 
-from shapely.ops import transform as _transform
-def a_2d(geom):
-    if geom is None or geom.is_empty:
-        return geom
-    return _transform(lambda x, y, z=None: (x, y), geom)
+    from shapely.ops import transform as _transform
+    def a_2d(geom):
+        if geom is None or geom.is_empty:
+            return geom
+        return _transform(lambda x, y, z=None: (x, y), geom)
 
-df_geo["geometry"] = df_geo["geometry"].apply(a_2d)
-df_geo = df_geo.to_crs(4326)
+    if not df_geo.empty:
+        df_geo["geometry"] = df_geo["geometry"].apply(a_2d)
+        df_geo = df_geo.to_crs(4326)
 
-# --- Mantener solo una fila por zona priorizando el mayor nivel de riesgo.
-prioridad_nivel = {"Riesgo extremo": 3, "Riesgo importante": 2, "Riesgo": 1}
-df_geo["_prioridad"] = df_geo["Nivel de riesgo"].map(prioridad_nivel).fillna(0)
-df_geo = (
-    df_geo.sort_values("_prioridad", ascending=False)
-          .drop_duplicates(subset="zona", keep="first")
-          .drop(columns="_prioridad")
-)
+        # --- Mantener solo una fila por zona priorizando el mayor nivel de riesgo.
+        prioridad_nivel = {"Riesgo extremo": 3, "Riesgo importante": 2, "Riesgo": 1}
+        df_geo["_prioridad"] = df_geo["Nivel de riesgo"].map(prioridad_nivel).fillna(0)
+        df_geo = (
+            df_geo.sort_values("_prioridad", ascending=False)
+                  .drop_duplicates(subset="zona", keep="first")
+                  .drop(columns="_prioridad")
+        )
+    else:
+        df_geo = gpd.GeoDataFrame(columns=["zona", "provincia"], geometry=[], crs=4326)
 
-# --- Exportación a GeoJSON.
-salida = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/MAPA_AVISOS_AEMET.geojson"
-try:
-    df_geo.to_file(salida, driver="GeoJSON", engine="pyogrio", write_options={"RFC7946": "YES"})
-except Exception:
-    df_geo.to_file(salida, driver="GeoJSON")
+    # --- Exportación a GeoJSON.
+    salida = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/MAPA_AVISOS_AEMET.geojson"
+    try:
+        if not df_geo.empty:
+            try:
+                df_geo.to_file(salida, driver="GeoJSON", engine="pyogrio", write_options={"RFC7946": "YES"})
+            except Exception:
+                df_geo.to_file(salida, driver="GeoJSON")
+        else:
+            # Si no hay geometrías, exportamos un FeatureCollection vacío.
+            gpd.GeoDataFrame(geometry=[], crs=4326).to_file(salida, driver="GeoJSON")
+    except Exception:
+        pass
 
-# --- Resumen para texto.
-datos = df_geo.copy()
-datos = pd.DataFrame(datos.drop(columns=[df_geo.geometry.name]))
+    # --- Resumen para texto.
+    datos = df_geo.copy()
+    datos = pd.DataFrame(datos.drop(columns=[df_geo.geometry.name], errors="ignore"))
 
-def find_col(df_in, targets):
-    normmap = {c: _norm(c) for c in df_in.columns}
-    trgs = set(map(_norm, targets))
-    for c, n in normmap.items():
-        if n in trgs:
-            return c
-    return None
+    def find_col(df_in, targets):
+        normmap = {c: _norm(c) for c in df_in.columns}
+        trgs = set(map(_norm, targets))
+        for c, n in normmap.items():
+            if n in trgs:
+                return c
+        return None
 
-col_fenomeno = find_col(datos, ["fenomeno", "fenómeno", "fenomenos", "fenómenos"])
-col_ccaa     = find_col(datos, ["CCAA"])
-col_nivel    = find_col(datos, ["nivel de riesgo", "nivel riesgo", "riesgo"])
+    col_fenomeno = find_col(datos, ["fenomeno", "fenómeno", "fenomenos", "fenómenos"])
+    col_ccaa     = find_col(datos, ["CCAA"])
+    col_nivel    = find_col(datos, ["nivel de riesgo", "nivel riesgo", "riesgo"])
 
-if col_fenomeno is None or col_ccaa is None or col_nivel is None:
-    raise RuntimeError("Faltan columnas para el resumen (Fenómeno, CCAA, Nivel de riesgo).")
+    if col_fenomeno is None or col_ccaa is None or col_nivel is None or datos.empty:
+        # Si faltan columnas o no hay filas tras el cruce, usamos el resumen mínimo.
+        resumen = pd.DataFrame([{"numero_ccaa": "cero"}])
+    else:
+        datos[col_fenomeno] = datos[col_fenomeno].astype(str).str.lower()
 
-datos[col_fenomeno] = datos[col_fenomeno].astype(str).str.lower()
+        numeros_letras = {0:"cero",1:"uno",2:"dos",3:"tres",4:"cuatro",5:"cinco",6:"seis",7:"siete",8:"ocho",9:"nueve"}
+        tipos_alertas  = {"Riesgo": "amarilla", "Riesgo importante": "naranja", "Riesgo extremo": "roja"}
 
-numeros_letras = {0:"cero",1:"uno",2:"dos",3:"tres",4:"cuatro",5:"cinco",6:"seis",7:"siete",8:"ocho",9:"nueve"}
-tipos_alertas  = {"Riesgo": "amarilla", "Riesgo importante": "naranja", "Riesgo extremo": "roja"}
+        provincias_aviso = sorted(pd.Series(datos[col_ccaa]).astype(str).unique().tolist())
+        n = len(provincias_aviso)
+        n_letras = numeros_letras.get(n, str(n))
 
-provincias_aviso = sorted(pd.Series(datos[col_ccaa]).astype(str).unique().tolist())
-n = len(provincias_aviso)
-n_letras = numeros_letras.get(n, str(n))
+        prioridad = {"Riesgo": 1, "Riesgo importante": 2, "Riesgo extremo": 3}
 
-prioridad = {"Riesgo": 1, "Riesgo importante": 2, "Riesgo extremo": 3}
+        resumen = (
+            datos.assign(Prioridad=datos[col_nivel].map(prioridad))
+                 .sort_values("Prioridad", ascending=False)
+                 .drop_duplicates(col_ccaa)
+                 .loc[:, [col_ccaa, col_nivel, col_fenomeno]]
+                 .reset_index(drop=True)
+        )
 
-resumen = (
-    datos.assign(Prioridad=datos[col_nivel].map(prioridad))
-         .sort_values("Prioridad", ascending=False)
-         .drop_duplicates(col_ccaa)
-         .loc[:, [col_ccaa, col_nivel, col_fenomeno]]
-         .reset_index(drop=True)
-)
+        resumen = resumen.rename(columns={
+            col_ccaa: "ccaa",
+            col_nivel: "alerta",
+            col_fenomeno: "fenomeno",
+        })
 
-resumen = resumen.rename(columns={
-    col_ccaa: "ccaa",
-    col_nivel: "alerta",
-    col_fenomeno: "fenomeno",
-})
+        resumen["alerta"] = resumen["alerta"].map(tipos_alertas)
+        resumen["numero_ccaa"] = n_letras
 
-resumen["alerta"] = resumen["alerta"].map(tipos_alertas)
-resumen["numero_ccaa"] = n_letras
+else:
+    # No hay tabla: forzamos el resumen mínimo
+    resumen = pd.DataFrame([{"numero_ccaa": "cero"}])
 
 # --- Preparar la subida a Google Sheets.
 SUBIR_A_SHEETS    = True
@@ -290,17 +313,35 @@ def subir_df_a_sheet(
 # --- Subida a Google Sheets.
 if SUBIR_A_SHEETS:
     try:
-        print(f"{hora()}Subiendo DataFrame a Google Sheets (hoja '{PESTANA_AVISOS}')…")
-        df_sin_geom = pd.DataFrame(df_geo.drop(columns=[df_geo.geometry.name]))
-        subir_df_a_sheet(
-            df=df_sin_geom,
-            spreadsheet_id=ID_HOJA_CALCULO,
-            rango_inicial=INICIO_A1_AVISOS,
-            pestana=PESTANA_AVISOS,
-            ruta_credenciales=RUTA_CREDENCIALES,
-            alcances=ALCANCES_SHEETS,
-        )
-        print(f"{hora()}Subida completada en la hoja '{PESTANA_AVISOS}'.")
+        if tabla_existe and not df.empty:
+            print(f"{hora()}Subiendo DataFrame a Google Sheets (hoja '{PESTANA_AVISOS}')…")
+            # En avisos subimos la tabla geoespacial SIN geometría
+            # (si existe df_geo con datos; si no, se sube df sin geometría).
+            try:
+                df_sin_geom = pd.DataFrame(df_geo.drop(columns=[df_geo.geometry.name]))
+            except Exception:
+                df_sin_geom = df.copy()
+            subir_df_a_sheet(
+                df=df_sin_geom,
+                spreadsheet_id=ID_HOJA_CALCULO,
+                rango_inicial=INICIO_A1_AVISOS,
+                pestana=PESTANA_AVISOS,
+                ruta_credenciales=RUTA_CREDENCIALES,
+                alcances=ALCANCES_SHEETS,
+            )
+            print(f"{hora()}Subida completada en la hoja '{PESTANA_AVISOS}'.")
+        else:
+            print(f"{hora()}No hay tabla. Subiendo formato mínimo a '{PESTANA_AVISOS}' …")
+            df_minimo = pd.DataFrame([{"numero_ccaa": "cero"}])
+            subir_df_a_sheet(
+                df=df_minimo,
+                spreadsheet_id=ID_HOJA_CALCULO,
+                rango_inicial=INICIO_A1_AVISOS,
+                pestana=PESTANA_AVISOS,
+                ruta_credenciales=RUTA_CREDENCIALES,
+                alcances=ALCANCES_SHEETS,
+            )
+            print(f"{hora()}Subida mínima completada en '{PESTANA_AVISOS}'.")
 
         print(f"{hora()}Subiendo Resumen a Google Sheets (hoja '{PESTANA_DATOS}')…")
         subir_df_a_sheet(
