@@ -5,7 +5,7 @@ import json
 import time
 from io import StringIO
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -38,11 +38,15 @@ except Exception:
 BASE = "https://opendata.aemet.es/opendata/api"
 _TZ_LOCAL = ZoneInfo("Europe/Madrid")
 
+FECHA_OBJETIVO = "2025-09-27" 
+
+# Rutas
 RUTA_INDICATIVOS       = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/ids_estaciones.xlsx"
 RUTA_MAESTRO           = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/datos_mapa.xlsx"
 RUTA_BASE              = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/"
 RUTA_COMPLEMENTARIOS   = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/"
 
+# Sheets
 SUBIR_A_SHEETS   = True
 ID_HOJA_CALCULO  = "1o0DICxbYpq_OqgwTqU9-8GaQzjYj14cdureHGN-uLQA"
 NOMBRE_PESTANA   = "precipitaciones"
@@ -50,14 +54,26 @@ INICIO_A1        = f"{NOMBRE_PESTANA}!A1"
 RUTA_CREDENCIALES = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/credenciales_google_sheet.json"
 ALCANCES_SHEETS  = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Comportamiento rápido
+ESPERAR_SI_429 = False
+PAUSA_ENTRE_ESTACIONES = 0.0
+
 # =========================
 # Descarga y helpers
 # =========================
 def sesion_reintentos() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "aemet-downloader/1.1", "Connection": "close", "Accept": "application/json"})
-    retry = Retry(total=5, backoff_factor=0.7, status_forcelist=[500, 502, 503, 504, 524],
-                  allowed_methods=["GET"], respect_retry_after_header=True)
+    s.headers.update({"User-Agent": "aemet-downloader/1.2", "Connection": "close", "Accept": "application/json"})
+    retry = Retry(
+        total=3,                  # menos reintentos para ir rápido
+        connect=3,
+        read=3,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
@@ -76,7 +92,7 @@ def _iter_api_keys(keys):
             if isinstance(k, str) and k.strip():
                 yield k.strip()
 
-def aemet_descargar(endpoint: str, params_extra: dict | None = None) -> str:
+def aemet_descargar(endpoint: str, params_extra: dict | None = None, timeout=(5, 20)) -> str:
     s = sesion_reintentos()
     url = f"{BASE}/{endpoint.lstrip('/')}"
     if "?" in url and "api_key=" in url:
@@ -88,7 +104,7 @@ def aemet_descargar(endpoint: str, params_extra: dict | None = None) -> str:
         if params_extra:
             params.update(params_extra)
         try:
-            r = s.get(url, params=params, timeout=(5, 45))
+            r = s.get(url, params=params, timeout=timeout)
             r.raise_for_status()
             try:
                 meta = _decode_json_with_bom(r)
@@ -97,10 +113,11 @@ def aemet_descargar(endpoint: str, params_extra: dict | None = None) -> str:
                 snippet = r.content[:120].decode("utf-8", "replace")
                 errores.append(f"[key#{idx}] No-JSON (CT={ct}). Cuerpo≈ {snippet!r}")
                 continue
-            if "datos" not in meta:
+            datos_url = meta.get("datos")
+            if not datos_url:
                 errores.append(f"[key#{idx}] Sin 'datos': {meta}")
                 continue
-            r2 = s.get(meta["datos"], timeout=(5, 60))
+            r2 = s.get(datos_url, timeout=(5, 25))
             r2.raise_for_status()
             return r2.text
         except HTTPError as e:
@@ -108,6 +125,11 @@ def aemet_descargar(endpoint: str, params_extra: dict | None = None) -> str:
             ct = getattr(e.response, "headers", {}).get("Content-Type", "")
             body = (getattr(e.response, "text", "") or "")[:160]
             errores.append(f"[key#{idx}] HTTP {code} (CT={ct}) {body!r}")
+            if code == 429 and not ESPERAR_SI_429:
+                # saltar rápido a la siguiente key sin dormir
+                continue
+            if code == 429 and ESPERAR_SI_429:
+                time.sleep(65)
         except (Timeout, ConnectionError) as e:
             errores.append(f"[key#{idx}] Red: {type(e).__name__}: {e}")
         except Exception as e:
@@ -127,10 +149,11 @@ def a_texto_a_df(texto: str, content_hint: str | None = None) -> pd.DataFrame:
             return pd.json_normalize(obj)
     except Exception:
         pass
+    # CSV con inferencia de separador rápida
     try:
-        return pd.read_csv(StringIO(texto), sep=";", engine="python")
+        return pd.read_csv(StringIO(texto), sep=None, engine="python")
     except Exception:
-        return pd.DataFrame({"contenido": [texto]})
+        return pd.DataFrame()
 
 def guardar_xlsx(df: pd.DataFrame, ruta_salida: Path) -> Path:
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
@@ -151,62 +174,26 @@ def tratamiento(df: pd.DataFrame) -> pd.DataFrame:
         )
     return df
 
-def _quizas_esperar_por_429(err: Exception) -> bool:
-    s = str(err)
-    if " 429" in s or 'estado" : 429' in s or "estado': 429" in s:
-        print("   → 429 recibido: esperando 65s para reintentar…")
-        time.sleep(65)
-        return True
-    return False
-
-# ===== Sonda rápida + selección del último día con datos =====
-def _probe_aemet_rapido(indicativo: str, fecha: datetime.date, api_key: str) -> bool:
-    fechaini = f"{fecha:%Y-%m-%d}T00:00:00UTC"
-    fechafin = f"{fecha:%Y-%m-%d}T23:59:00UTC"
-    url_meta = f"{BASE}/valores/climatologicos/diarios/datos/fechaini/{fechaini}/fechafin/{fechafin}/estacion/{indicativo}"
-    try:
-        r = requests.get(url_meta, params={"api_key": api_key}, timeout=(3, 8))
-        r.raise_for_status()
-        meta = json.loads(r.content.decode("utf-8-sig", errors="replace").strip())
-        datos_url = meta.get("datos")
-        if not datos_url:
-            return False
-        r2 = requests.get(datos_url, timeout=(3, 10))
-        r2.raise_for_status()
-        txt = r2.text
-        if not txt or len(txt) < 5:
-            return False
-        df = a_texto_a_df(txt)
-        return df is not None and not df.empty
-    except Exception:
-        return False
-
-def _fecha_aemet_mas_reciente(indicativo: str, max_retraso: int = 5, deadline_seg: int = 40) -> tuple[str, str]:
-    import time as _time
-    t0 = _time.monotonic()
-    hoy_local = datetime.now(_TZ_LOCAL).date()
-    primera_key = next(_iter_api_keys(api_keys), None)
-    if not primera_key:
-        raise RuntimeError("No hay API key configurada.")
-    for delta in range(1, max_retraso + 1):
-        if _time.monotonic() - t0 > deadline_seg:
-            break
-        candidato = hoy_local - timedelta(days=delta)
-        if _probe_aemet_rapido(indicativo, candidato, primera_key):
-            fechaini = f"{candidato:%Y-%m-%d}T00:00:00UTC"
-            fechafin = f"{candidato:%Y-%m-%d}T23:59:00UTC"
-            return fechaini, fechafin
-    candidato = hoy_local - timedelta(days=max_retraso)
-    return (f"{candidato:%Y-%m-%d}T00:00:00UTC", f"{candidato:%Y-%m-%d}T23:59:00UTC")
-
 # =========================
-# Descarga por indicativos
+# Descarga por indicativos (solo el día marcado)
 # =========================
+def _parse_fecha_objetivo(fecha: str | date) -> tuple[str, str]:
+    if isinstance(fecha, str):
+        f = datetime.strptime(fecha, "%Y-%m-%d").date()
+    elif isinstance(fecha, date):
+        f = fecha
+    else:
+        raise ValueError("FECHA_OBJETIVO debe ser str YYYY-MM-DD o datetime.date")
+    fechaini = f"{f:%Y-%m-%d}T00:00:00UTC"
+    fechafin = f"{f:%Y-%m-%d}T23:59:00UTC"
+    return fechaini, fechafin
+
 def descargar_por_indicativos_xlsx(
     ruta_indicativos: str | Path,
+    fecha_objetivo: str | date,
     hoja: int | str = 0,
     columna: str = "indicativo",
-    pausa_seg: float = 1.5,
+    pausa_seg: float = PAUSA_ENTRE_ESTACIONES,
 ) -> pd.DataFrame:
     tabla = pd.read_excel(ruta_indicativos, sheet_name=hoja)
     if columna not in tabla.columns:
@@ -216,22 +203,8 @@ def descargar_por_indicativos_xlsx(
         .replace("", pd.NA).dropna().unique().tolist()
     )
 
-    # Detectar el día más reciente con datos (sonda rápida, 1-3 indicativos)
-    print("Determinando día más reciente con datos (sonda rápida)…")
-    fechaini = fechafin = None
-    for probe in indicativos[:3]:
-        print(f"  · probando {probe}…", end="", flush=True)
-        try:
-            fechaini, fechafin = _fecha_aemet_mas_reciente(probe, max_retraso=5, deadline_seg=40)
-            print(f" OK → {fechaini} → {fechafin}")
-            break
-        except Exception as e:
-            print(f" falló ({e})")
-    if fechaini is None:
-        candidato = datetime.now(_TZ_LOCAL).date() - timedelta(days=5)
-        fechaini = f"{candidato:%Y-%m-%d}T00:00:00UTC"
-        fechafin = f"{candidato:%Y-%m-%d}T23:59:00UTC"
-        print(f"AVISO: usando fallback {fechaini} → {fechafin}")
+    fechaini, fechafin = _parse_fecha_objetivo(fecha_objetivo)
+    print(f"Descargando datos del día marcado: {fechaini} → {fechafin}")
 
     dfs: list[pd.DataFrame] = []
     total = len(indicativos)
@@ -239,20 +212,17 @@ def descargar_por_indicativos_xlsx(
     for i, ind in enumerate(indicativos, start=1):
         try:
             endpoint = f"/valores/climatologicos/diarios/datos/fechaini/{fechaini}/fechafin/{fechafin}/estacion/{ind}"
-            try:
-                texto = aemet_descargar(endpoint, params_extra=None)
-            except Exception as e1:
-                if _quizas_esperar_por_429(e1):
-                    texto = aemet_descargar(endpoint, params_extra=None)
-                else:
-                    raise
+            texto = aemet_descargar(endpoint, params_extra=None, timeout=(4, 18))
+            if not texto or len(texto) < 3:
+                print(f"[{i}/{total}] {ind}: sin datos (respuesta vacía) → salto rápido")
+                continue
             df_raw = a_texto_a_df(texto)
             if df_raw is None or df_raw.empty:
-                print(f"[{i}/{total}] {ind}: vacío tras parseo")
+                print(f"[{i}/{total}] {ind}: vacío tras parseo → salto rápido")
                 continue
             df = tratamiento(df_raw)
             if df is None or df.empty:
-                print(f"[{i}/{total}] {ind}: vacío tras tratamiento")
+                print(f"[{i}/{total}] {ind}: vacío tras tratamiento → salto rápido")
                 continue
             if "indicativo" not in df.columns:
                 df = df.copy()
@@ -260,7 +230,11 @@ def descargar_por_indicativos_xlsx(
             dfs.append(df)
             print(f"[{i}/{total}] {ind}: OK ({len(df)} filas)")
         except Exception as e:
-            print(f"[{i}/{total}] {ind}: ERROR -> {e}")
+            msg = str(e)
+            if "429" in msg and not ESPERAR_SI_429:
+                print(f"[{i}/{total}] {ind}: 429 → salto rápido a la siguiente API key/estación")
+            else:
+                print(f"[{i}/{total}] {ind}: ERROR -> {e} → salto rápido")
         finally:
             if i < total and pausa_seg and pausa_seg > 0:
                 time.sleep(pausa_seg)
@@ -332,9 +306,9 @@ def transformar_maestro(maestro: pd.DataFrame) -> pd.DataFrame:
 
 def categorizar_y_plot(maestro: pd.DataFrame) -> pd.DataFrame:
     if "diferencia" in maestro.columns:
+        # Hist rápido (no bloqueante)
         maestro["diferencia"].hist(bins=30, edgecolor="black")
         plt.xlabel("diferencia"); plt.ylabel("Frecuencia"); plt.title("Distribución de la variable diferencia")
-        # plt.show()
         print(maestro["diferencia"].describe())
 
         bins = [-float("inf"), -10, -5, 5, 10, float("inf")]
@@ -375,7 +349,6 @@ def categorizar_y_plot(maestro: pd.DataFrame) -> pd.DataFrame:
 
     print(maestro.head()); print(f"Número de filas: {len(maestro)}")
     return maestro
-
 
 # =========================
 # Google Sheets
@@ -474,12 +447,17 @@ def subir_df_a_sheet(
 # =========================
 if __name__ == "__main__":
     print("Descargando por indicativos del Excel…")
-    df_todas = descargar_por_indicativos_xlsx(RUTA_INDICATIVOS)
+    df_todas = descargar_por_indicativos_xlsx(
+        ruta_indicativos=RUTA_INDICATIVOS,
+        fecha_objetivo=FECHA_OBJETIVO,
+        hoja=0,
+        columna="indicativo",
+        pausa_seg=PAUSA_ENTRE_ESTACIONES,
+    )
 
     print("Combinando con maestro…")
     df_maestro = combinar_con_maestro(df_todas, RUTA_MAESTRO)
 
-    # Guardar df_maestro.xlsx dentro de Complementarios
     ruta_complementarios = Path(RUTA_COMPLEMENTARIOS)
     ruta_complementarios.mkdir(parents=True, exist_ok=True)
     ruta_df_maestro = ruta_complementarios / "df_maestro.xlsx"
@@ -490,17 +468,14 @@ if __name__ == "__main__":
     maestro = transformar_maestro(df_maestro)
     maestro = categorizar_y_plot(maestro)
 
-    # Categorías: poner celdas vacías en lugar de NaN antes de exportar
     if "categoria" in maestro.columns:
         maestro["categoria"] = maestro["categoria"].astype(object).where(maestro["categoria"].notna(), "")
 
-    # Export final
     ruta_final = Path(RUTA_BASE) / "MAPA_LLUVIAS.xlsx"
     with pd.ExcelWriter(ruta_final, engine="openpyxl") as writer:
         maestro.to_excel(writer, index=False)
     print("Exportado:", ruta_final)
 
-    # Subida a Google Sheets
     if SUBIR_A_SHEETS:
         if not _GSHEETS_DISPONIBLE:
             print("AVISO: faltan dependencias de Google Sheets (pip install google-api-python-client google-auth-httplib2 google-auth httplib2)")
