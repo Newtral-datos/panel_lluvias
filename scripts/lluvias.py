@@ -38,10 +38,9 @@ except Exception:
 BASE = "https://opendata.aemet.es/opendata/api"
 _TZ_LOCAL = ZoneInfo("Europe/Madrid")
 
-# Si la dejas en None, el script intentará automáticamente las fechas recientes (ayer, anteayer, ...).
-# Para fijar un día concreto, usa: FECHA_OBJETIVO = "2025-09-27"
+# Ya no se usa FECHA_OBJETIVO ni el escaneo de días recientes, pero lo dejamos por compatibilidad.
 FECHA_OBJETIVO: str | None = None
-NDIAS_RECIENTES_A_PROBAR = 7  # cuántos días hacia atrás probar si FECHA_OBJETIVO es None
+NDIAS_RECIENTES_A_PROBAR = 7  # sin uso en la ruta de 5 días, se conserva por compatibilidad
 
 # Rutas
 RUTA_INDICATIVOS       = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/ids_estaciones.xlsx"
@@ -68,7 +67,7 @@ def sesion_reintentos() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "aemet-downloader/1.2", "Connection": "close", "Accept": "application/json"})
     retry = Retry(
-        total=3,                  # menos reintentos para ir rápido
+        total=3,
         connect=3,
         read=3,
         backoff_factor=0.6,
@@ -129,7 +128,6 @@ def aemet_descargar(endpoint: str, params_extra: dict | None = None, timeout=(5,
             body = (getattr(e.response, "text", "") or "")[:160]
             errores.append(f"[key#{idx}] HTTP {code} (CT={ct}) {body!r}")
             if code == 429 and not ESPERAR_SI_429:
-                # saltar rápido a la siguiente key sin dormir
                 continue
             if code == 429 and ESPERAR_SI_429:
                 time.sleep(65)
@@ -152,7 +150,6 @@ def a_texto_a_df(texto: str, content_hint: str | None = None) -> pd.DataFrame:
             return pd.json_normalize(obj)
     except Exception:
         pass
-    # CSV con inferencia de separador rápida
     try:
         return pd.read_csv(StringIO(texto), sep=None, engine="python")
     except Exception:
@@ -178,7 +175,7 @@ def tratamiento(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =========================
-# Fechas objetivo
+# Fechas objetivo / Rango últimos n días
 # =========================
 def _parse_fecha_objetivo(fecha: str | date) -> tuple[str, str]:
     if isinstance(fecha, str):
@@ -192,17 +189,27 @@ def _parse_fecha_objetivo(fecha: str | date) -> tuple[str, str]:
     return fechaini, fechafin
 
 def fechas_candidatas_recientes(ndias: int = NDIAS_RECIENTES_A_PROBAR):
-    """Genera YYYY-MM-DD de los últimos `ndias` (ayer, anteayer, ...), en tz local."""
+    """(No usado en el modo 5 días) Genera YYYY-MM-DD de los últimos `ndias` (ayer, anteayer, ...), en tz local."""
     hoy = datetime.now(_TZ_LOCAL).date()
     for i in range(1, ndias + 1):
         yield (hoy - timedelta(days=i)).strftime("%Y-%m-%d")
 
+def rango_ultimos_ndias(n: int = 5) -> tuple[str, str]:
+    """Devuelve fechaini/fechafin (UTC) para los últimos n días excluyendo hoy: hoy-n → ayer."""
+    hoy = datetime.now(_TZ_LOCAL).date()
+    fin = hoy - timedelta(days=1)          # ayer
+    ini = hoy - timedelta(days=n)          # hace n días
+    fechaini = f"{ini:%Y-%m-%d}T00:00:00UTC"
+    fechafin = f"{fin:%Y-%m-%d}T23:59:00UTC"
+    return fechaini, fechafin
+
 # =========================
-# Descarga por indicativos (solo el día marcado)
+# Descarga por indicativos (rango de fechas)
 # =========================
-def descargar_por_indicativos_xlsx(
+def descargar_por_indicativos_rango(
     ruta_indicativos: str | Path,
-    fecha_objetivo: str | date,
+    fechaini: str,
+    fechafin: str,
     hoja: int | str = 0,
     columna: str = "indicativo",
     pausa_seg: float = PAUSA_ENTRE_ESTACIONES,
@@ -215,8 +222,7 @@ def descargar_por_indicativos_xlsx(
         .replace("", pd.NA).dropna().unique().tolist()
     )
 
-    fechaini, fechafin = _parse_fecha_objetivo(fecha_objetivo)
-    print(f"Descargando datos del día marcado: {fechaini} → {fechafin}")
+    print(f"Descargando datos del RANGO: {fechaini} → {fechafin}")
 
     dfs: list[pd.DataFrame] = []
     total = len(indicativos)
@@ -226,15 +232,15 @@ def descargar_por_indicativos_xlsx(
             endpoint = f"/valores/climatologicos/diarios/datos/fechaini/{fechaini}/fechafin/{fechafin}/estacion/{ind}"
             texto = aemet_descargar(endpoint, params_extra=None, timeout=(4, 18))
             if not texto or len(texto) < 3:
-                print(f"[{i}/{total}] {ind}: sin datos (respuesta vacía) → salto rápido")
+                print(f"[{i}/{total}] {ind}: sin datos (respuesta vacía) → salto")
                 continue
             df_raw = a_texto_a_df(texto)
             if df_raw is None or df_raw.empty:
-                print(f"[{i}/{total}] {ind}: vacío tras parseo → salto rápido")
+                print(f"[{i}/{total}] {ind}: vacío tras parseo → salto")
                 continue
             df = tratamiento(df_raw)
             if df is None or df.empty:
-                print(f"[{i}/{total}] {ind}: vacío tras tratamiento → salto rápido")
+                print(f"[{i}/{total}] {ind}: vacío tras tratamiento → salto")
                 continue
             if "indicativo" not in df.columns:
                 df = df.copy()
@@ -244,9 +250,9 @@ def descargar_por_indicativos_xlsx(
         except Exception as e:
             msg = str(e)
             if "429" in msg and not ESPERAR_SI_429:
-                print(f"[{i}/{total}] {ind}: 429 → salto rápido a la siguiente API key/estación")
+                print(f"[{i}/{total}] {ind}: 429 → siguiente key/estación")
             else:
-                print(f"[{i}/{total}] {ind}: ERROR -> {e} → salto rápido")
+                print(f"[{i}/{total}] {ind}: ERROR -> {e} → salto")
         finally:
             if i < total and pausa_seg and pausa_seg > 0:
                 time.sleep(pausa_seg)
@@ -264,9 +270,8 @@ def combinar_con_maestro(
         raise ValueError(f"El maestro no tiene la columna '{clave}'")
     if df_descargas.empty:
         return maestro
-    base = df_descargas.drop_duplicates(subset=[clave], keep="last")
-    cols_aemet = [c for c in base.columns if c != clave]
-    combinado = maestro.merge(base[[clave] + cols_aemet], on=clave, how="left")
+    # Unir metadatos del maestro a CADA fila descargada (todas las fechas del rango)
+    combinado = df_descargas.merge(maestro, on=clave, how="left")
     return combinado
 
 # =========================
@@ -318,7 +323,6 @@ def transformar_maestro(maestro: pd.DataFrame) -> pd.DataFrame:
 
 def categorizar_y_plot(maestro: pd.DataFrame) -> pd.DataFrame:
     if "diferencia" in maestro.columns:
-        # Hist rápido (no bloqueante)
         maestro["diferencia"].hist(bins=30, edgecolor="black")
         plt.xlabel("diferencia"); plt.ylabel("Frecuencia"); plt.title("Distribución de la variable diferencia")
         print(maestro["diferencia"].describe())
@@ -458,35 +462,23 @@ def subir_df_a_sheet(
 # Main
 # =========================
 if __name__ == "__main__":
-    print("Descargando por indicativos del Excel…")
+    print("Descargando por indicativos para los últimos 5 días (excluyendo hoy)…")
 
-    # Construir lista de fechas candidatas
-    if isinstance(FECHA_OBJETIVO, str) and FECHA_OBJETIVO.strip():
-        candidatas = [FECHA_OBJETIVO.strip()]
-    else:
-        candidatas = list(fechas_candidatas_recientes(NDIAS_RECIENTES_A_PROBAR))
+    # Rango de 5 días hacia atrás respecto al día actual (hoy-5 → hoy-1)
+    fechaini, fechafin = rango_ultimos_ndias(5)
 
-    df_todas = pd.DataFrame()
-    fecha_usada = None
-    for ftxt in candidatas:
-        print(f"Probando fecha {ftxt}…")
-        df_todas = descargar_por_indicativos_xlsx(
-            ruta_indicativos=RUTA_INDICATIVOS,
-            fecha_objetivo=ftxt,
-            hoja=0,
-            columna="indicativo",
-            pausa_seg=PAUSA_ENTRE_ESTACIONES,
-        )
-        if not df_todas.empty:
-            fecha_usada = ftxt
-            print(f"➜ Usando {ftxt}: {len(df_todas)} filas descargadas.")
-            break
-        else:
-            print(f"Sin datos para {ftxt}. Probando la anterior…")
+    # Descarga para todas las estaciones del Excel de indicativos
+    df_todas = descargar_por_indicativos_rango(
+        ruta_indicativos=RUTA_INDICATIVOS,
+        fechaini=fechaini,
+        fechafin=fechafin,
+        hoja=0,
+        columna="indicativo",
+        pausa_seg=PAUSA_ENTRE_ESTACIONES,
+    )
 
     if df_todas.empty:
-        raise RuntimeError("No se encontraron datos para las fechas recientes candidatas. "
-                           "Puedes fijar FECHA_OBJETIVO='YYYY-MM-DD' para forzar un día concreto.")
+        raise RuntimeError("No se encontraron datos para el rango solicitado (últimos 5 días excluyendo hoy).")
 
     print("Combinando con maestro…")
     df_maestro = combinar_con_maestro(df_todas, RUTA_MAESTRO)
