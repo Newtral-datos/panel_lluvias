@@ -38,7 +38,10 @@ except Exception:
 BASE = "https://opendata.aemet.es/opendata/api"
 _TZ_LOCAL = ZoneInfo("Europe/Madrid")
 
-FECHA_OBJETIVO = "2025-09-27" 
+# Si la dejas en None, el script intentará automáticamente las fechas recientes (ayer, anteayer, ...).
+# Para fijar un día concreto, usa: FECHA_OBJETIVO = "2025-09-27"
+FECHA_OBJETIVO: str | None = None
+NDIAS_RECIENTES_A_PROBAR = 7  # cuántos días hacia atrás probar si FECHA_OBJETIVO es None
 
 # Rutas
 RUTA_INDICATIVOS       = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/ids_estaciones.xlsx"
@@ -175,7 +178,7 @@ def tratamiento(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =========================
-# Descarga por indicativos (solo el día marcado)
+# Fechas objetivo
 # =========================
 def _parse_fecha_objetivo(fecha: str | date) -> tuple[str, str]:
     if isinstance(fecha, str):
@@ -188,6 +191,15 @@ def _parse_fecha_objetivo(fecha: str | date) -> tuple[str, str]:
     fechafin = f"{f:%Y-%m-%d}T23:59:00UTC"
     return fechaini, fechafin
 
+def fechas_candidatas_recientes(ndias: int = NDIAS_RECIENTES_A_PROBAR):
+    """Genera YYYY-MM-DD de los últimos `ndias` (ayer, anteayer, ...), en tz local."""
+    hoy = datetime.now(_TZ_LOCAL).date()
+    for i in range(1, ndias + 1):
+        yield (hoy - timedelta(days=i)).strftime("%Y-%m-%d")
+
+# =========================
+# Descarga por indicativos (solo el día marcado)
+# =========================
 def descargar_por_indicativos_xlsx(
     ruta_indicativos: str | Path,
     fecha_objetivo: str | date,
@@ -447,13 +459,34 @@ def subir_df_a_sheet(
 # =========================
 if __name__ == "__main__":
     print("Descargando por indicativos del Excel…")
-    df_todas = descargar_por_indicativos_xlsx(
-        ruta_indicativos=RUTA_INDICATIVOS,
-        fecha_objetivo=FECHA_OBJETIVO,
-        hoja=0,
-        columna="indicativo",
-        pausa_seg=PAUSA_ENTRE_ESTACIONES,
-    )
+
+    # Construir lista de fechas candidatas
+    if isinstance(FECHA_OBJETIVO, str) and FECHA_OBJETIVO.strip():
+        candidatas = [FECHA_OBJETIVO.strip()]
+    else:
+        candidatas = list(fechas_candidatas_recientes(NDIAS_RECIENTES_A_PROBAR))
+
+    df_todas = pd.DataFrame()
+    fecha_usada = None
+    for ftxt in candidatas:
+        print(f"Probando fecha {ftxt}…")
+        df_todas = descargar_por_indicativos_xlsx(
+            ruta_indicativos=RUTA_INDICATIVOS,
+            fecha_objetivo=ftxt,
+            hoja=0,
+            columna="indicativo",
+            pausa_seg=PAUSA_ENTRE_ESTACIONES,
+        )
+        if not df_todas.empty:
+            fecha_usada = ftxt
+            print(f"➜ Usando {ftxt}: {len(df_todas)} filas descargadas.")
+            break
+        else:
+            print(f"Sin datos para {ftxt}. Probando la anterior…")
+
+    if df_todas.empty:
+        raise RuntimeError("No se encontraron datos para las fechas recientes candidatas. "
+                           "Puedes fijar FECHA_OBJETIVO='YYYY-MM-DD' para forzar un día concreto.")
 
     print("Combinando con maestro…")
     df_maestro = combinar_con_maestro(df_todas, RUTA_MAESTRO)
@@ -471,11 +504,13 @@ if __name__ == "__main__":
     if "categoria" in maestro.columns:
         maestro["categoria"] = maestro["categoria"].astype(object).where(maestro["categoria"].notna(), "")
 
+    # Export final
     ruta_final = Path(RUTA_BASE) / "MAPA_LLUVIAS.xlsx"
     with pd.ExcelWriter(ruta_final, engine="openpyxl") as writer:
         maestro.to_excel(writer, index=False)
     print("Exportado:", ruta_final)
 
+    # Subida a Google Sheets
     if SUBIR_A_SHEETS:
         if not _GSHEETS_DISPONIBLE:
             print("AVISO: faltan dependencias de Google Sheets (pip install google-api-python-client google-auth-httplib2 google-auth httplib2)")
