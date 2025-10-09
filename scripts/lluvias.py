@@ -38,10 +38,6 @@ except Exception:
 BASE = "https://opendata.aemet.es/opendata/api"
 _TZ_LOCAL = ZoneInfo("Europe/Madrid")
 
-# Ya no se usa FECHA_OBJETIVO ni el escaneo de días recientes, pero lo dejamos por compatibilidad.
-FECHA_OBJETIVO: str | None = None
-NDIAS_RECIENTES_A_PROBAR = 7  # sin uso en la ruta de 5 días, se conserva por compatibilidad
-
 # Rutas
 RUTA_INDICATIVOS       = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/ids_estaciones.xlsx"
 RUTA_MAESTRO           = "/Users/miguel.ros/Desktop/PANEL_LLUVIAS/complementarios_lluvias/datos_mapa.xlsx"
@@ -175,25 +171,8 @@ def tratamiento(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =========================
-# Fechas objetivo / Rango últimos n días
+# Fechas objetivo / Rango últimos 5 días
 # =========================
-def _parse_fecha_objetivo(fecha: str | date) -> tuple[str, str]:
-    if isinstance(fecha, str):
-        f = datetime.strptime(fecha, "%Y-%m-%d").date()
-    elif isinstance(fecha, date):
-        f = fecha
-    else:
-        raise ValueError("FECHA_OBJETIVO debe ser str YYYY-MM-DD o datetime.date")
-    fechaini = f"{f:%Y-%m-%d}T00:00:00UTC"
-    fechafin = f"{f:%Y-%m-%d}T23:59:00UTC"
-    return fechaini, fechafin
-
-def fechas_candidatas_recientes(ndias: int = NDIAS_RECIENTES_A_PROBAR):
-    """(No usado en el modo 5 días) Genera YYYY-MM-DD de los últimos `ndias` (ayer, anteayer, ...), en tz local."""
-    hoy = datetime.now(_TZ_LOCAL).date()
-    for i in range(1, ndias + 1):
-        yield (hoy - timedelta(days=i)).strftime("%Y-%m-%d")
-
 def rango_ultimos_ndias(n: int = 5) -> tuple[str, str]:
     """Devuelve fechaini/fechafin (UTC) para los últimos n días excluyendo hoy: hoy-n → ayer."""
     hoy = datetime.now(_TZ_LOCAL).date()
@@ -270,7 +249,7 @@ def combinar_con_maestro(
         raise ValueError(f"El maestro no tiene la columna '{clave}'")
     if df_descargas.empty:
         return maestro
-    # Unir metadatos del maestro a CADA fila descargada (todas las fechas del rango)
+    # Unir metadatos del maestro a CADA fila descargada (filtraremos antes a una sola fecha)
     combinado = df_descargas.merge(maestro, on=clave, how="left")
     return combinado
 
@@ -367,108 +346,16 @@ def categorizar_y_plot(maestro: pd.DataFrame) -> pd.DataFrame:
     return maestro
 
 # =========================
-# Google Sheets
-# =========================
-def hora() -> str:
-    return _dt.now().strftime("[%Y-%m-%d %H:%M:%S] ")
-
-def _parse_a1(celda: str):
-    m = re.match(r"^([A-Za-z]+)(\d+)?$", celda)
-    if not m:
-        return "A", 1
-    col, fila = m.group(1).upper(), int(m.group(2) or 1)
-    return col, fila
-
-def _exec_reintentado(req, intentos=5, espera_base=1.5):
-    for i in range(intentos):
-        try:
-            return req.execute(num_retries=5)
-        except Exception as e:
-            transitorio = isinstance(e, TimeoutError) or isinstance(e, HttpError)
-            if (i == intentos - 1) or not transitorio:
-                raise
-            time.sleep(espera_base * (2 ** i))
-
-def _construir_servicio_sheets(ruta_credenciales: str, alcances: list[str]):
-    if not _GSHEETS_DISPONIBLE:
-        raise RuntimeError("Faltan dependencias de Google Sheets. Instala: google-api-python-client google-auth-httplib2 google-auth httplib2")
-    cred = Credentials.from_service_account_file(ruta_credenciales, scopes=alcances)
-    _http = httplib2.Http(timeout=500)
-    _authed_http = AuthorizedHttp(cred, http=_http)
-    return build("sheets", "v4", http=_authed_http, cache_discovery=False)
-
-def subir_df_a_sheet(
-    df: pd.DataFrame,
-    spreadsheet_id: str,
-    rango_inicial: str,
-    pestana: str,
-    ruta_credenciales: str,
-    alcances: list[str] = ALCANCES_SHEETS,
-    filas_bloque: int = 2000,
-):
-    servicio = _construir_servicio_sheets(ruta_credenciales=ruta_credenciales, alcances=alcances)
-
-    df = df.copy()
-    for c in ["LATITUD", "LONGITUD", "LATITUDE", "LONGITUDE", "latitud", "longitud"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-
-    for col in df.columns:
-        if is_datetime64_any_dtype(df[col]) or is_datetime64tz_dtype(df[col]):
-            df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    def _a_texto(x):
-        if isinstance(x, (pd.Timestamp, _dt)): return x.strftime("%Y-%m-%d %H:%M:%S")
-        return x
-
-    df = df.applymap(_a_texto).where(pd.notnull(df), None)
-
-    print(f"{hora()}Limpiando hoja '{pestana}' …")
-    _exec_reintentado(servicio.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=f"{pestana}!A1:ZZ"))
-
-    cabecera = list(map(str, df.columns.tolist()))
-    filas = [[("" if v is None else str(v)) for v in fila] for fila in df.to_numpy().tolist()]
-
-    celda_a1 = rango_inicial.replace(f"{pestana}!", "")
-    col_inicio, fila_inicio = _parse_a1(celda_a1)
-
-    rango_cabecera = f"{pestana}!{col_inicio}{fila_inicio}"
-    _exec_reintentado(
-        servicio.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id, range=rango_cabecera, valueInputOption="RAW", body={"values": [cabecera]}
-        )
-    )
-
-    if not filas:
-        print(f"{hora()}No hay filas para subir en '{pestana}'."); return
-
-    fila_datos_inicio = fila_inicio + 1
-    total = len(filas)
-    bloques = math.ceil(total / filas_bloque)
-    print(f"{hora()}Subiendo datos a '{pestana}' en {bloques} bloque(s) de hasta {filas_bloque} fila(s)…")
-
-    for i in range(bloques):
-        i0, i1 = i * filas_bloque, min((i + 1) * filas_bloque, total)
-        bloque = filas[i0:i1]
-        rango_escritura = f"{pestana}!{col_inicio}{fila_datos_inicio + i0}"
-        _exec_reintentado(
-            servicio.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id, range=rango_escritura, valueInputOption="RAW", body={"values": bloque}
-            )
-        )
-        print(f"{hora()}  · Bloque {i+1}/{bloques} ({i1 - i0} filas) OK")
-
-# =========================
 # Main
 # =========================
 if __name__ == "__main__":
     print("Descargando por indicativos para los últimos 5 días (excluyendo hoy)…")
 
-    # Rango de 5 días hacia atrás respecto al día actual (hoy-5 → hoy-1)
+    # 1) Rango de 5 días hacia atrás respecto al día actual (hoy-5 → hoy-1)
     fechaini, fechafin = rango_ultimos_ndias(5)
 
-    # Descarga para todas las estaciones del Excel de indicativos
-    df_todas = descargar_por_indicativos_rango(
+    # 2) Descarga para todas las estaciones del Excel de indicativos (puede traer varias fechas)
+    df_rango = descargar_por_indicativos_rango(
         ruta_indicativos=RUTA_INDICATIVOS,
         fechaini=fechaini,
         fechafin=fechafin,
@@ -477,9 +364,34 @@ if __name__ == "__main__":
         pausa_seg=PAUSA_ENTRE_ESTACIONES,
     )
 
-    if df_todas.empty:
+    if df_rango.empty:
         raise RuntimeError("No se encontraron datos para el rango solicitado (últimos 5 días excluyendo hoy).")
 
+    # 3) Elegir UNA única fecha: la más reciente con datos
+    if "fecha" not in df_rango.columns:
+        raise RuntimeError("La descarga no contiene columna 'fecha'.")
+
+    df_rango = df_rango.copy()
+    df_rango["__fecha_dt"] = pd.to_datetime(df_rango["fecha"], errors="coerce")
+    df_rango = df_rango.dropna(subset=["__fecha_dt"])
+    if df_rango.empty:
+        raise RuntimeError("No hay fechas válidas en los datos descargados.")
+
+    df_rango["__fecha_dia"] = df_rango["__fecha_dt"].dt.date
+    fechas_disponibles = sorted(df_rango["__fecha_dia"].unique())
+    fecha_objetivo = max(fechas_disponibles)  # <- LA MÁS RECIENTE CON CUALQUIER DATO
+
+    # (Opcional) log de cobertura por fecha para trazabilidad
+    cobertura = df_rango.groupby("__fecha_dia")["indicativo"].nunique().sort_index()
+    print("Cobertura por fecha (nº estaciones con dato):")
+    for f, n in cobertura.items():
+        print(f"  {f}: {n} estaciones")
+    print(f"→ Fecha objetivo seleccionada: {fecha_objetivo}")
+
+    # 4) Filtrar TODOS los registros a esa ÚNICA fecha
+    df_todas = df_rango.loc[df_rango["__fecha_dia"] == fecha_objetivo].drop(columns=["__fecha_dt", "__fecha_dia"])
+
+    # 5) Continuar el pipeline
     print("Combinando con maestro…")
     df_maestro = combinar_con_maestro(df_todas, RUTA_MAESTRO)
 
